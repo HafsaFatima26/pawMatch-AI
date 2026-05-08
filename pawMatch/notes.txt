@@ -1,0 +1,7 @@
+User answers questions (in their language:
+"how much noise can you tolerate?", "are you home a
+lot?", "do you have kids?") → those answers get translated into a
+ 10-dimensional  target vector on the same scale your 
+ cats use → cosine similarity / weighted distance against every cat → rank.
+
+ 
