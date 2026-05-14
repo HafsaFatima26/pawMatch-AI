@@ -55,6 +55,14 @@ USER_TO_CAT = {
     "time_away":               "independence",
 }
 
+# Derived sets — keep in sync with USER_TO_CAT
+MAPPED_TRAITS   = list(USER_TO_CAT.values())                              # traits with direct user questions
+UNMAPPED_TRAITS = [t for t in TRAIT_COLS if t not in MAPPED_TRAITS]      # traits inferred from correlations
+
+# Traits whose R² (unmapped ~ mapped) is below this threshold get
+# zero weight and fall back to the population mean instead of inference.
+INFERENCE_R2_THRESHOLD = 0.10
+
 # ── Default feature weights (must sum to 1.0) ─────────────────────────────────
 DEFAULT_WEIGHTS = {
     "neuroticism":    0.05,
@@ -73,12 +81,46 @@ DEFAULT_WEIGHTS = {
 _df_clean: Optional[pd.DataFrame] = None
 _df_norm:  Optional[pd.DataFrame] = None
 
+# Inference models — populated by _fit_inference_models() at data-load time
+_inference_coefs: dict = {}   # trait -> np.ndarray shape (len(MAPPED_TRAITS)+1,), intercept last
+_pop_means_norm:  dict = {}   # trait -> float, normalized population mean
+_r_squared:       dict = {}   # trait -> float, goodness-of-fit for each unmapped trait
+
+
 def _load_data(path: str = "cats_clean.xlsx") -> None:
     global _df_clean, _df_norm
     _df_clean = pd.read_excel(path, sheet_name="cats_clean")
     _df_norm  = _df_clean[["cat_id", "Cat_sex"]].copy()
     for c in TRAIT_COLS:
         _df_norm[c] = (_df_clean[c] - LIKERT_MIN) / (LIKERT_MAX - LIKERT_MIN)
+    _fit_inference_models(_df_norm)
+
+
+def _fit_inference_models(df_norm: pd.DataFrame) -> None:
+    """Fit OLS regression: each unmapped trait ~ all mapped traits.
+
+    Learns how cat traits co-occur in the population so that, at
+    recommendation time, a user's 5 explicit answers can be used to
+    infer likely preferences for the 5 unanswered trait dimensions.
+
+    Stores coefficients, population means, and R² for every unmapped
+    trait. Traits with R² below INFERENCE_R2_THRESHOLD are flagged for
+    weight-zeroing instead of inference (see build_user_profile).
+    """
+    global _inference_coefs, _pop_means_norm, _r_squared
+    X      = df_norm[MAPPED_TRAITS].values               # (N, 5)
+    X_aug  = np.c_[X, np.ones(len(X))]                  # (N, 6) — appends bias column
+
+    for trait in UNMAPPED_TRAITS:
+        y     = df_norm[trait].values
+        coef, *_ = np.linalg.lstsq(X_aug, y, rcond=None)
+        y_hat = X_aug @ coef
+        ss_res = float(np.sum((y - y_hat) ** 2))
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+
+        _inference_coefs[trait] = coef                   # shape (6,)
+        _pop_means_norm[trait]  = float(y.mean())
+        _r_squared[trait]       = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
 # ── Step 1: Build user target profile ─────────────────────────────────────────
@@ -89,26 +131,65 @@ def build_user_profile(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert user lifestyle answers (1-7 scale) into a normalized target vector.
 
+    For traits the user answered explicitly, the target is their answer.
+    For unmapped traits (neuroticism, child_friendly, pet_friendly,
+    trainability, dominance) the target is inferred via OLS regression
+    trained on the cat population:
+
+        unmapped_target = coefs @ mapped_targets + intercept
+
+    This means a user who wants a highly affectionate, high-grooming cat
+    will automatically get low-neuroticism and high-child_friendly targets
+    because those traits co-occur in the data.
+
+    Traits whose regression R² < INFERENCE_R2_THRESHOLD (currently:
+    dominance) have their weight zeroed — we genuinely cannot infer the
+    user's preference, so we exclude that dimension from scoring entirely.
+
     Returns
     -------
     target_vector : np.ndarray (10,) — normalized [0, 1]
     weight_vector : np.ndarray (10,) — per-trait importance weights
     """
     weights = {**DEFAULT_WEIGHTS, **(weights_override or {})}
-    target_raw = {trait: 0.5 for trait in TRAIT_COLS}  # neutral midpoint default
+    target_raw = {trait: 0.5 for trait in TRAIT_COLS}
 
+    # ── Step 1: map explicit user answers ────────────────────────────────────
     for user_key, cat_trait in USER_TO_CAT.items():
         if user_key in user_answers:
             target_raw[cat_trait] = (user_answers[user_key] - LIKERT_MIN) / (LIKERT_MAX - LIKERT_MIN)
 
-    # Allow direct cat-trait overrides
+    # Allow direct cat-trait overrides (e.g. child_friendly=6 passed in)
     for trait in TRAIT_COLS:
         if trait in user_answers:
             target_raw[trait] = (user_answers[trait] - LIKERT_MIN) / (LIKERT_MAX - LIKERT_MIN)
 
+    explicitly_set = (
+        {cat_trait for user_key, cat_trait in USER_TO_CAT.items() if user_key in user_answers}
+        | {trait for trait in TRAIT_COLS if trait in user_answers}
+    )
+
+    # ── Step 2: infer unmapped trait targets from regression ─────────────────
+    if _inference_coefs:
+        mapped_vec = np.array([target_raw[t] for t in MAPPED_TRAITS])  # (5,)
+
+        for trait in UNMAPPED_TRAITS:
+            if trait in explicitly_set:
+                continue  # user gave a direct answer — honour it
+
+            r2 = _r_squared.get(trait, 0.0)
+            if r2 >= INFERENCE_R2_THRESHOLD:
+                coef = _inference_coefs[trait]                        # (6,): [w0..w4, bias]
+                pred = float(np.dot(coef[:-1], mapped_vec) + coef[-1])
+                target_raw[trait] = float(np.clip(pred, 0.0, 1.0))
+            else:
+                # Below threshold: no reliable signal — use pop mean, drop from scoring
+                target_raw[trait] = _pop_means_norm.get(trait, 0.5)
+                weights[trait] = 0.0
+
     target_vector = np.array([target_raw[t] for t in TRAIT_COLS])
     weight_vector = np.array([weights[t]    for t in TRAIT_COLS])
-    weight_vector = weight_vector / weight_vector.sum()  # normalize to sum=1
+    weight_vector = weight_vector / weight_vector.sum()               # normalize to sum=1
     return target_vector, weight_vector
 
 
