@@ -33,9 +33,13 @@ results = recommend(
 print(results)
 """
 
-import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Literal, Optional
+
 import numpy as np
-from typing import Optional
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 # ── Schema constants ──────────────────────────────────────────────────────────
 TRAIT_COLS = [
@@ -87,9 +91,51 @@ _pop_means_norm:  dict = {}   # trait -> float, normalized population mean
 _r_squared:       dict = {}   # trait -> float, goodness-of-fit for each unmapped trait
 
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+class RecommendRequest(BaseModel):
+    user_answers: Dict[str, int]
+    top_k: int = Field(default=5, ge=1, le=50)
+    weights_override: Optional[Dict[str, float]] = None
+    sex_filter: Optional[Literal["Female", "Male", "Unknown"]] = None
+    max_neuroticism: Optional[int] = Field(default=None, ge=1, le=7)
+    min_child_friendly: Optional[int] = Field(default=None, ge=1, le=7)
+    min_pet_friendly: Optional[int] = Field(default=None, ge=1, le=7)
+    data_path: str = "cats_clean.xlsx"
+
+
+class RecommendationItem(BaseModel):
+    rank: int
+    cat_id: str
+    Cat_sex: str
+    distance: float
+    similarity: float
+    neuroticism: int
+    energy_level: int
+    affection: int
+    child_friendly: int
+    pet_friendly: int
+    vocal: int
+    trainability: int
+    grooming: int
+    independence: int
+    dominance: int
+
+
+class RecommendResponse(BaseModel):
+    results: List[RecommendationItem]
+
+
+app = FastAPI(title="Cat Adoption Recommender API", version="1.0.0")
+
+
 def _load_data(path: str = "cats_clean.xlsx") -> None:
     global _df_clean, _df_norm
-    _df_clean = pd.read_excel(path, sheet_name="cats_clean")
+    resolved_path = Path(path)
+    if not resolved_path.is_absolute():
+        resolved_path = BASE_DIR / resolved_path
+    _df_clean = pd.read_excel(resolved_path, sheet_name="cats_clean")
     _df_norm  = _df_clean[["cat_id", "Cat_sex"]].copy()
     for c in TRAIT_COLS:
         _df_norm[c] = (_df_clean[c] - LIKERT_MIN) / (LIKERT_MAX - LIKERT_MIN)
@@ -297,16 +343,62 @@ def recommend(
     return enriched
 
 
+@app.get("/")
+def health() -> dict:
+    return {"status": "ok", "endpoint": "/recommend"}
+
+
+@app.post("/recommend", response_model=RecommendResponse)
+def recommend_endpoint(payload: RecommendRequest) -> RecommendResponse:
+    # Enforce Likert constraints for all provided answers.
+    invalid_answers = {k: v for k, v in payload.user_answers.items() if not (LIKERT_MIN <= v <= LIKERT_MAX)}
+    if invalid_answers:
+        raise HTTPException(
+            status_code=422,
+            detail=f"All user_answers values must be in {LIKERT_MIN}-{LIKERT_MAX}. Invalid: {invalid_answers}",
+        )
+
+    try:
+        df = recommend(
+            user_answers=payload.user_answers,
+            top_k=payload.top_k,
+            weights_override=payload.weights_override,
+            sex_filter=payload.sex_filter,
+            max_neuroticism=payload.max_neuroticism,
+            min_child_friendly=payload.min_child_friendly,
+            min_pet_friendly=payload.min_pet_friendly,
+            data_path=payload.data_path,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    serialized = []
+    for row in df.reset_index().to_dict(orient="records"):
+        serialized.append({
+            "rank": int(row["rank"]),
+            "cat_id": row["cat_id"],
+            "Cat_sex": row["Cat_sex"],
+            "distance": float(row["distance"]),
+            "similarity": float(row["similarity"]),
+            "neuroticism": int(row["neuroticism"]),
+            "energy_level": int(row["energy_level"]),
+            "affection": int(row["affection"]),
+            "child_friendly": int(row["child_friendly"]),
+            "pet_friendly": int(row["pet_friendly"]),
+            "vocal": int(row["vocal"]),
+            "trainability": int(row["trainability"]),
+            "grooming": int(row["grooming"]),
+            "independence": int(row["independence"]),
+            "dominance": int(row["dominance"]),
+        })
+
+    return RecommendResponse(results=serialized)
+
+
 # ── CLI quick test ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    results = recommend(
-        user_answers={
-            "activity":               4,
-            "affection_need":         6,
-            "maintenance_willingness":3,
-            "noise_tolerance":        3,
-            "time_away":              4,
-        },
-        top_k=5,
-    )
-    print(results.to_string())
+    import uvicorn
+
+    uvicorn.run("recommend:app", host="0.0.0.0", port=8000, reload=True)
