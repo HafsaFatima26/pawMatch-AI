@@ -102,7 +102,7 @@ class RecommendRequest(BaseModel):
     max_neuroticism: Optional[int] = Field(default=None, ge=1, le=7)
     min_child_friendly: Optional[int] = Field(default=None, ge=1, le=7)
     min_pet_friendly: Optional[int] = Field(default=None, ge=1, le=7)
-    data_path: str = "cats_clean.xlsx"
+    data_path: str = "cats_with_breeds.csv"
 
 
 class RecommendationItem(BaseModel):
@@ -121,6 +121,8 @@ class RecommendationItem(BaseModel):
     grooming: int
     independence: int
     dominance: int
+    cat_name: Optional[str] = None
+    cat_breed: Optional[str] = None
 
 
 class RecommendResponse(BaseModel):
@@ -130,12 +132,17 @@ class RecommendResponse(BaseModel):
 app = FastAPI(title="Cat Adoption Recommender API", version="1.0.0")
 
 
-def _load_data(path: str = "cats_clean.xlsx") -> None:
+def _load_data(path: str = "cats_with_breeds.csv") -> None:
     global _df_clean, _df_norm
     resolved_path = Path(path)
     if not resolved_path.is_absolute():
         resolved_path = BASE_DIR / resolved_path
-    _df_clean = pd.read_excel(resolved_path, sheet_name="cats_clean")
+
+    if resolved_path.suffix.lower() in (".csv",):
+        _df_clean = pd.read_csv(resolved_path)
+    else:
+        # assume Excel workbook with sheet 'cats_clean'
+        _df_clean = pd.read_excel(resolved_path, sheet_name="cats_clean")
     _df_norm  = _df_clean[["cat_id", "Cat_sex"]].copy()
     for c in TRAIT_COLS:
         _df_norm[c] = (_df_clean[c] - LIKERT_MIN) / (LIKERT_MAX - LIKERT_MIN)
@@ -305,7 +312,7 @@ def recommend(
     max_neuroticism:    Optional[int] = None,
     min_child_friendly: Optional[int] = None,
     min_pet_friendly:   Optional[int] = None,
-    data_path:          str = "cats_clean.xlsx",
+    data_path:          str = "cats_with_breeds.csv",
 ) -> pd.DataFrame:
     """
     Full recommendation pipeline.
@@ -338,7 +345,8 @@ def recommend(
         min_pet_friendly=min_pet_friendly,
     )
     top_cats = rank_cats(df_filtered, target_vector, weight_vector, top_k=top_k)
-    enriched = top_cats.merge(_df_clean[["cat_id"] + TRAIT_COLS], on="cat_id", how="left")
+    extra_cols = [c for c in (['cat_name', 'cat_breed'] + TRAIT_COLS) if c in _df_clean.columns]
+    enriched = top_cats.merge(_df_clean[["cat_id"] + extra_cols], on="cat_id", how="left")
     enriched.index = top_cats.index
     return enriched
 
@@ -392,6 +400,8 @@ def recommend_endpoint(payload: RecommendRequest) -> RecommendResponse:
             "grooming": int(row["grooming"]),
             "independence": int(row["independence"]),
             "dominance": int(row["dominance"]),
+            "cat_name": None if pd.isna(row.get("cat_name")) else row.get("cat_name"),
+            "cat_breed": None if pd.isna(row.get("cat_breed")) else row.get("cat_breed"),
         })
 
     return RecommendResponse(results=serialized)
