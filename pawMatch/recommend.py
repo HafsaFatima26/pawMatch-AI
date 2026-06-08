@@ -39,6 +39,7 @@ from typing import Dict, List, Literal, Optional
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ── Schema constants ──────────────────────────────────────────────────────────
@@ -130,6 +131,14 @@ class RecommendResponse(BaseModel):
 
 
 app = FastAPI(title="Cat Adoption Recommender API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _load_data(path: str = "cats_with_breeds.csv") -> None:
